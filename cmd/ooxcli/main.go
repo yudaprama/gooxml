@@ -30,6 +30,8 @@ func main() {
 	switch cmd {
 	case "extract":
 		err = cmdExtract(args)
+	case "edit":
+		err = cmdEdit(args)
 	case "info":
 		err = cmdInfo(args)
 	case "validate":
@@ -49,6 +51,7 @@ func usage() {
 
 Usage:
   ooxcli extract [--baseurl <url>] <input.docx|xlsx|pptx>        Extract text as Markdown (stdout)
+  ooxcli edit <input.docx|xlsx|pptx> [--out <output>]            Apply edit operations (ops JSON via --ops or stdin)
   ooxcli info <input.docx|xlsx|pptx>                             Document info (JSON stdout)
   ooxcli validate <input.docx|xlsx|pptx>                         Validate document structure
 `)

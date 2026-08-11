@@ -1,4 +1,4 @@
-name: Auto Tag On Push
+name: Auto Tag & Release
 
 on:
   push:
@@ -16,6 +16,9 @@ concurrency:
 jobs:
   tag:
     runs-on: ubuntu-latest
+    outputs:
+      next_tag: ${{ steps.next.outputs.next_tag }}
+      skipped: ${{ steps.create_tag.outputs.skipped }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,14 +47,91 @@ jobs:
           echo "next_tag=${next_tag}" >> "$GITHUB_OUTPUT"
 
       - name: Create and push tag
+        id: create_tag
         env:
           NEXT_TAG: ${{ steps.next.outputs.next_tag }}
         run: |
           if git tag -l "${NEXT_TAG}" | grep -q "${NEXT_TAG}"; then
             echo "Tag ${NEXT_TAG} already exists; skipping."
+            echo "skipped=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git tag -a "${NEXT_TAG}" -m "Release ${NEXT_TAG}"
           git push origin "${NEXT_TAG}"
+          echo "skipped=false" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ooxcli
+    runs-on: ubuntu-latest
+    needs: tag
+    if: needs.tag.outputs.skipped == 'false'
+    strategy:
+      matrix:
+        goos: [linux, darwin, windows]
+        goarch: [amd64, arm64]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        shell: bash
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p dist
+          bin="ooxcli-${{ matrix.goos }}-${{ matrix.goarch }}"
+          if [[ "${{ matrix.goos }}" == "windows" ]]; then
+            bin="${bin}.exe"
+          fi
+          go build -trimpath -ldflags="-s -w" \
+            -o "dist/${bin}" ./cmd/ooxcli
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: ooxcli-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*.exe
+          if-no-files-found: ignore
+          retention-days: 1
+
+  release:
+    name: Publish release
+    runs-on: ubuntu-latest
+    needs: [tag, build]
+    if: needs.tag.outputs.skipped == 'false'
+    steps:
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create / update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.tag.outputs.next_tag }}
+        run: |
+          assets=($(find dist -type f -name "ooxcli-*" | sort))
+          echo "Tag: ${TAG}"
+          echo "Assets:"
+          printf '  %s\n' "${assets[@]}"
+
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            echo "Release ${TAG} exists; uploading assets."
+            gh release upload "${TAG}" "${assets[@]}" --clobber
+          else
+            echo "Creating release ${TAG}."
+            gh release create "${TAG}" "${assets[@]}" \
+              --title "ooxcli ${TAG}" \
+              --notes "Automated build of the ooxcli CLI for tag ${TAG}."
+          fi
