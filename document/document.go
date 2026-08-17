@@ -180,6 +180,34 @@ func (d *Document) ToMarkdownWithImages(imageDir string) (string, error) {
 	return md.String(), nil
 }
 
+// SaveMarkdownWithImages extracts the document to a markdown file and images to a directory.
+// The mdFilePath parameter specifies the output markdown file path.
+// The imageDir parameter specifies where to save extracted images.
+// Images will be saved with names like "image1.png", "image2.jpg", etc.
+// and referenced in the markdown file with relative paths based on imageDir.
+func (d *Document) SaveMarkdownWithImages(mdFilePath, imageDir string) error {
+	// Convert to markdown with images (this saves images to imageDir)
+	md, err := d.ToMarkdownWithImages(imageDir)
+	if err != nil {
+		return fmt.Errorf("failed to convert to markdown: %w", err)
+	}
+
+	// Ensure the directory for the markdown file exists
+	mdDir := filepath.Dir(mdFilePath)
+	if mdDir != "" {
+		if err := os.MkdirAll(mdDir, 0755); err != nil {
+			return fmt.Errorf("failed to create markdown file directory: %w", err)
+		}
+	}
+
+	// Write the markdown file
+	if err := os.WriteFile(mdFilePath, []byte(md), 0644); err != nil {
+		return fmt.Errorf("failed to write markdown file: %w", err)
+	}
+
+	return nil
+}
+
 // ToMarkdownWithImageURLs converts the document to markdown with images served via local fileserver URLs.
 // Images are automatically saved to the user data directory and become accessible via the Wails fileserver.
 // The baseURL parameter should be "/files" to match the user data fileserver route configured in main.go.

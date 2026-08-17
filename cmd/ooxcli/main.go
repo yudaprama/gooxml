@@ -50,7 +50,8 @@ func usage() {
 	fmt.Fprintf(os.Stderr, `ooxcli — OOXML operations via github.com/yudaprama/gooxml
 
 Usage:
-  ooxcli extract [--baseurl <url>] <input.docx|xlsx|pptx>        Extract text as Markdown (stdout)
+  ooxcli extract [--save <output.md>] [--imagedir <dir>] [--baseurl <url>] <input.docx|xlsx|pptx>
+                                       Extract text as Markdown (stdout, or save to file with --save)
   ooxcli edit <input.docx|xlsx|pptx> [--out <output>]            Apply edit operations (ops JSON via --ops or stdin)
   ooxcli info <input.docx|xlsx|pptx>                             Document info (JSON stdout)
   ooxcli validate <input.docx|xlsx|pptx>                         Validate document structure
@@ -76,6 +77,8 @@ func readFile(path string) ([]byte, error) {
 
 func cmdExtract(args []string) error {
 	baseURL := "/files"
+	savePath := ""
+	imageDir := ""
 	input := ""
 
 	for i := 0; i < len(args); i++ {
@@ -86,6 +89,18 @@ func cmdExtract(args []string) error {
 				return errors.New("--baseurl requires a value")
 			}
 			baseURL = args[i]
+		case "--save":
+			i++
+			if i >= len(args) {
+				return errors.New("--save requires a value")
+			}
+			savePath = args[i]
+		case "--imagedir":
+			i++
+			if i >= len(args) {
+				return errors.New("--imagedir requires a value")
+			}
+			imageDir = args[i]
 		default:
 			if input == "" {
 				input = args[i]
@@ -93,7 +108,7 @@ func cmdExtract(args []string) error {
 		}
 	}
 	if input == "" {
-		return errors.New("usage: ooxcli extract [--baseurl <url>] <input.docx|xlsx|pptx>")
+		return errors.New("usage: ooxcli extract [--save <output.md>] [--imagedir <dir>] [--baseurl <url>] <input.docx|xlsx|pptx>")
 	}
 
 	ext := detectExt(input)
@@ -103,19 +118,31 @@ func cmdExtract(args []string) error {
 
 	switch ext {
 	case ".docx":
-		return extractDocx(input, baseURL)
+		return extractDocx(input, baseURL, savePath, imageDir)
 	case ".xlsx":
-		return extractXlsx(input, baseURL)
+		return extractXlsx(input, baseURL, savePath, imageDir)
 	case ".pptx":
-		return extractPptx(input, baseURL)
+		return extractPptx(input, baseURL, savePath, imageDir)
 	}
 	return nil
 }
 
-func extractDocx(path, baseURL string) error {
+func extractDocx(path, baseURL, savePath, imageDir string) error {
 	doc, err := document.Open(path)
 	if err != nil {
 		return fmt.Errorf("open docx: %w", err)
+	}
+
+	if savePath != "" {
+		if imageDir == "" {
+			imageDir = filepath.Join(filepath.Dir(savePath), "images")
+		}
+		if err := doc.SaveMarkdownWithImages(savePath, imageDir); err != nil {
+			return fmt.Errorf("save markdown with images: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "saved: %s\n", savePath)
+		fmt.Fprintf(os.Stderr, "images: %s\n", imageDir)
+		return nil
 	}
 
 	md, err := doc.ToMarkdownWithImageURLs(baseURL)
@@ -126,12 +153,34 @@ func extractDocx(path, baseURL string) error {
 	return nil
 }
 
-func extractXlsx(path, baseURL string) error {
+func extractXlsx(path, baseURL, savePath, imageDir string) error {
 	wb, err := spreadsheet.Open(path)
 	if err != nil {
 		return fmt.Errorf("open xlsx: %w", err)
 	}
 	defer func() { _ = wb.Close() }()
+
+	if savePath != "" {
+		if imageDir == "" {
+			imageDir = filepath.Join(filepath.Dir(savePath), "images")
+		}
+		if err := os.MkdirAll(imageDir, 0755); err != nil {
+			return fmt.Errorf("create image directory: %w", err)
+		}
+		md, err := wb.ToMarkdownWithImages(imageDir)
+		if err != nil {
+			return fmt.Errorf("convert to markdown: %w", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(savePath), 0755); err != nil {
+			return fmt.Errorf("create output directory: %w", err)
+		}
+		if err := os.WriteFile(savePath, []byte(md), 0644); err != nil {
+			return fmt.Errorf("write markdown file: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "saved: %s\n", savePath)
+		fmt.Fprintf(os.Stderr, "images: %s\n", imageDir)
+		return nil
+	}
 
 	md, err := wb.ToMarkdownWithImageURLs(baseURL)
 	if err != nil {
@@ -141,10 +190,32 @@ func extractXlsx(path, baseURL string) error {
 	return nil
 }
 
-func extractPptx(path, baseURL string) error {
+func extractPptx(path, baseURL, savePath, imageDir string) error {
 	pres, err := presentation.Open(path)
 	if err != nil {
 		return fmt.Errorf("open pptx: %w", err)
+	}
+
+	if savePath != "" {
+		if imageDir == "" {
+			imageDir = filepath.Join(filepath.Dir(savePath), "images")
+		}
+		if err := os.MkdirAll(imageDir, 0755); err != nil {
+			return fmt.Errorf("create image directory: %w", err)
+		}
+		md, err := pres.ToMarkdownWithImages(imageDir)
+		if err != nil {
+			return fmt.Errorf("convert to markdown: %w", err)
+		}
+		if err := os.MkdirAll(filepath.Dir(savePath), 0755); err != nil {
+			return fmt.Errorf("create output directory: %w", err)
+		}
+		if err := os.WriteFile(savePath, []byte(md), 0644); err != nil {
+			return fmt.Errorf("write markdown file: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "saved: %s\n", savePath)
+		fmt.Fprintf(os.Stderr, "images: %s\n", imageDir)
+		return nil
 	}
 
 	md, err := pres.ToMarkdownWithImageURLs(baseURL)
