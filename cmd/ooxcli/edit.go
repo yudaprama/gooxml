@@ -79,7 +79,49 @@ type EditOp struct {
 	IndentRight   int             `json:"indent_right,omitempty"`
 }
 
+// OpResult is the per-operation outcome inside an EditResult.
+type OpResult struct {
+	Index    int    `json:"index"`
+	Type     string `json:"type"`
+	Status   string `json:"status"` // "applied", "no_match", "error"
+	Modified int    `json:"modified"`
+	Error    string `json:"error,omitempty"`
+}
+
+// EditResult is the JSON summary emitted by "ooxcli edit --json" for
+// pipeline consumers (e.g. the Rust OfficeEditTool).
+type EditResult struct {
+	FilePath     string     `json:"file_path"`
+	OutputPath   string     `json:"output_path"`
+	Success      bool       `json:"success"`
+	RowsModified int        `json:"rows_modified"`
+	Operations   []OpResult `json:"operations"`
+	ErrorSummary string     `json:"error_summary,omitempty"`
+}
+
 func cmdEdit(args []string) error {
+	jsonOut := false
+	rest := make([]string, 0, len(args))
+	for _, a := range args {
+		if a == "--json" {
+			jsonOut = true
+			continue
+		}
+		rest = append(rest, a)
+	}
+
+	res, err := applyEdit(rest)
+	if jsonOut && res != nil {
+		out, merr := json.MarshalIndent(res, "", "  ")
+		if merr != nil {
+			return fmt.Errorf("marshal edit result: %w", merr)
+		}
+		fmt.Println(string(out))
+	}
+	return err
+}
+
+func applyEdit(args []string) (*EditResult, error) {
 	input := ""
 	output := ""
 	opsJSON := ""
@@ -89,13 +131,13 @@ func cmdEdit(args []string) error {
 		case "--out":
 			i++
 			if i >= len(args) {
-				return errors.New("--out requires a value")
+				return nil, errors.New("--out requires a value")
 			}
 			output = args[i]
 		case "--ops":
 			i++
 			if i >= len(args) {
-				return errors.New("--ops requires a value")
+				return nil, errors.New("--ops requires a value")
 			}
 			opsJSON = args[i]
 		default:
@@ -105,25 +147,25 @@ func cmdEdit(args []string) error {
 		}
 	}
 	if input == "" {
-		return errors.New("usage: ooxcli edit <input.docx|xlsx|pptx> [--out <output>] [--ops <json>]  (ops JSON read from stdin when --ops is omitted)")
+		return nil, errors.New("usage: ooxcli edit <input.docx|xlsx|pptx> [--out <output>] [--ops <json>]  (ops JSON read from stdin when --ops is omitted)")
 	}
 
 	var ops []EditOp
 	if opsJSON == "" {
 		data, err := io.ReadAll(os.Stdin)
 		if err != nil {
-			return fmt.Errorf("read ops from stdin: %w", err)
+			return nil, fmt.Errorf("read ops from stdin: %w", err)
 		}
 		opsJSON = string(data)
 	}
 	if strings.TrimSpace(opsJSON) == "" {
-		return errors.New("no operations provided (empty --ops or stdin)")
+		return nil, errors.New("no operations provided (empty --ops or stdin)")
 	}
 	if err := json.Unmarshal([]byte(opsJSON), &ops); err != nil {
-		return fmt.Errorf("parse operations: %w", err)
+		return nil, fmt.Errorf("parse operations: %w", err)
 	}
 	if len(ops) == 0 {
-		return errors.New("operations must not be empty")
+		return nil, errors.New("operations must not be empty")
 	}
 
 	target := input
@@ -131,17 +173,43 @@ func cmdEdit(args []string) error {
 		target = output
 	}
 
+	res := &EditResult{
+		FilePath:   input,
+		OutputPath: target,
+		Operations: []OpResult{},
+	}
 	ext := fileExtEdit(input)
+	var err error
 	switch ext {
 	case "docx":
-		return editDocx(input, target, ops)
+		res.Operations, err = editDocx(input, target, ops)
 	case "xlsx":
-		return editXlsx(input, target, ops)
+		res.Operations, err = editXlsx(input, target, ops)
 	case "pptx":
-		return editPptx(input, target, ops)
+		res.Operations, err = editPptx(input, target, ops)
 	default:
-		return fmt.Errorf("ooxcli edit supports .docx, .xlsx, .pptx (got .%s)", ext)
+		err = fmt.Errorf("ooxcli edit supports .docx, .xlsx, .pptx (got .%s)", ext)
 	}
+	if err != nil {
+		res.ErrorSummary = err.Error()
+		return res, err
+	}
+	res.Success = true
+	for _, op := range res.Operations {
+		res.RowsModified += op.Modified
+	}
+	return res, nil
+}
+
+func makeOpResult(index int, opType string, modified int, err error) OpResult {
+	r := OpResult{Index: index, Type: opType, Modified: modified, Status: "applied"}
+	if err != nil {
+		r.Status = "error"
+		r.Error = err.Error()
+	} else if modified == 0 {
+		r.Status = "no_match"
+	}
+	return r
 }
 
 func fileExtEdit(filename string) string {
@@ -154,35 +222,42 @@ func fileExtEdit(filename string) string {
 
 // --- docx ---
 
-func editDocx(input, output string, ops []EditOp) error {
+func editDocx(input, output string, ops []EditOp) ([]OpResult, error) {
 	doc, err := document.Open(input)
 	if err != nil {
-		return fmt.Errorf("open docx: %w", err)
+		return nil, fmt.Errorf("open docx: %w", err)
 	}
-	for _, op := range ops {
+	var results []OpResult
+	for i, op := range ops {
+		var modified int
 		switch op.Type {
 		case "replace_text":
-			if err := applyReplaceTextDocx(doc, op.Find, op.Replace); err != nil {
-				return err
-			}
+			modified, err = applyReplaceTextDocx(doc, op.Find, op.Replace)
 		case "append_paragraphs":
-			applyAppendParagraphsDocx(doc, op.Paragraphs)
+			modified = applyAppendParagraphsDocx(doc, op.Paragraphs)
 		case "append_table":
-			applyAppendTableDocx(doc, op.Rows)
+			modified = applyAppendTableDocx(doc, op.Rows)
 		case "delete_paragraph":
-			applyDeleteParagraphDocx(doc, op.Find)
+			modified = applyDeleteParagraphDocx(doc, op.Find)
 		case "format_paragraph":
-			applyFormatParagraphDocx(doc, op.Find, op)
+			modified = applyFormatParagraphDocx(doc, op.Find, op)
 		default:
-			return fmt.Errorf("unknown docx operation %q", op.Type)
+			err = fmt.Errorf("unknown docx operation %q", op.Type)
+		}
+		results = append(results, makeOpResult(i, op.Type, modified, err))
+		if err != nil {
+			return results, err
 		}
 	}
-	return doc.SaveToFile(output)
+	if err := doc.SaveToFile(output); err != nil {
+		return results, fmt.Errorf("save docx: %w", err)
+	}
+	return results, nil
 }
 
-func applyReplaceTextDocx(doc *document.Document, find, replace string) error {
+func applyReplaceTextDocx(doc *document.Document, find, replace string) (int, error) {
 	if find == "" {
-		return nil
+		return 0, nil
 	}
 	paras := doc.Paragraphs()
 	for _, p := range doc.StructuredDocumentTags() {
@@ -193,10 +268,11 @@ func applyReplaceTextDocx(doc *document.Document, find, replace string) error {
 			paras = append(paras, p)
 		}
 	}
+	n := 0
 	for _, para := range paras {
-		replaceInParagraph(para, find, replace)
+		n += replaceInParagraph(para, find, replace)
 	}
-	return nil
+	return n, nil
 }
 
 func allTables(doc *document.Document) []document.Table {
@@ -234,23 +310,25 @@ func tableParagraphs(doc *document.Document, tbl document.Table) []document.Para
 	return paras
 }
 
-func replaceInParagraph(para document.Paragraph, find, replace string) {
+func replaceInParagraph(para document.Paragraph, find, replace string) int {
 	runs := para.Runs()
 	if len(runs) == 0 {
-		return
+		return 0
 	}
 	for _, r := range runs {
 		txt := r.Text()
 		if strings.Contains(txt, find) {
+			n := strings.Count(txt, find)
 			r.ClearContent()
 			r.AddText(strings.ReplaceAll(txt, find, replace))
-			return
+			return n
 		}
 	}
 	full := joinRuns(runs)
 	if !strings.Contains(full, find) {
-		return
+		return 0
 	}
+	n := strings.Count(full, find)
 	newText := strings.ReplaceAll(full, find, replace)
 	firstRun := runs[0]
 	newRun := para.AddRun()
@@ -259,6 +337,7 @@ func replaceInParagraph(para document.Paragraph, find, replace string) {
 	for _, r := range runs {
 		para.RemoveRun(r)
 	}
+	return n
 }
 
 func copyRunFormatting(src, dst document.Run) {
@@ -286,7 +365,7 @@ func joinRuns(runs []document.Run) string {
 	return b.String()
 }
 
-func applyAppendParagraphsDocx(doc *document.Document, specs []ParagraphSpec) {
+func applyAppendParagraphsDocx(doc *document.Document, specs []ParagraphSpec) int {
 	for _, spec := range specs {
 		para := doc.AddParagraph()
 		switch spec.Type {
@@ -307,6 +386,7 @@ func applyAppendParagraphsDocx(doc *document.Document, specs []ParagraphSpec) {
 			applyRunStyle(run, rs)
 		}
 	}
+	return len(specs)
 }
 
 func applyBulletStyle(doc *document.Document, para document.Paragraph) {
@@ -329,7 +409,10 @@ func applyBulletStyle(doc *document.Document, para document.Paragraph) {
 	para.SetNumberingDefinition(nd)
 }
 
-func applyAppendTableDocx(doc *document.Document, rows []RowSpec) {
+func applyAppendTableDocx(doc *document.Document, rows []RowSpec) int {
+	if len(rows) == 0 {
+		return 0
+	}
 	tbl := doc.AddTable()
 	tblProps := tbl.Properties()
 	tblProps.SetWidthPercent(100)
@@ -343,11 +426,12 @@ func applyAppendTableDocx(doc *document.Document, rows []RowSpec) {
 			run.AddText(cellSpec.Text)
 		}
 	}
+	return len(rows)
 }
 
-func applyDeleteParagraphDocx(doc *document.Document, find string) {
+func applyDeleteParagraphDocx(doc *document.Document, find string) int {
 	if find == "" {
-		return
+		return 0
 	}
 	var toDelete []document.Paragraph
 	for _, p := range doc.Paragraphs() {
@@ -365,6 +449,7 @@ func applyDeleteParagraphDocx(doc *document.Document, find string) {
 	for i := len(toDelete) - 1; i >= 0; i-- {
 		doc.RemoveParagraph(toDelete[i])
 	}
+	return len(toDelete)
 }
 
 func containsText(para document.Paragraph, text string) bool {
@@ -376,18 +461,20 @@ func containsText(para document.Paragraph, text string) bool {
 	return false
 }
 
-func applyFormatParagraphDocx(doc *document.Document, find string, op EditOp) {
+func applyFormatParagraphDocx(doc *document.Document, find string, op EditOp) int {
 	if find == "" {
-		return
+		return 0
 	}
 	paras := doc.Paragraphs()
 	for _, p := range doc.StructuredDocumentTags() {
 		paras = append(paras, p.Paragraphs()...)
 	}
+	n := 0
 	for _, para := range paras {
 		if !containsText(para, find) {
 			continue
 		}
+		n++
 		props := para.Properties()
 		switch op.Alignment {
 		case "left":
@@ -412,6 +499,7 @@ func applyFormatParagraphDocx(doc *document.Document, find string, op EditOp) {
 			props.SetEndIndent(measurement.Distance(op.IndentRight) * measurement.Point)
 		}
 	}
+	return n
 }
 
 func applyRunStyle(run document.Run, rs RunSpec) {
@@ -497,25 +585,27 @@ func parseHexColor(s string) (color.Color, error) {
 
 // --- xlsx ---
 
-func editXlsx(input, output string, ops []EditOp) error {
+func editXlsx(input, output string, ops []EditOp) ([]OpResult, error) {
 	wb, err := spreadsheet.Open(input)
 	if err != nil {
-		return fmt.Errorf("open xlsx: %w", err)
+		return nil, fmt.Errorf("open xlsx: %w", err)
 	}
-	for _, op := range ops {
+	var results []OpResult
+	for i, op := range ops {
+		var modified int
 		switch op.Type {
 		case "replace_text":
-			applyReplaceTextXlsx(wb, op.Find, op.Replace)
+			modified = applyReplaceTextXlsx(wb, op.Find, op.Replace)
 		case "append_rows":
-			if err := applyAppendRowsXlsx(wb, op.Sheet, op.CellRows); err != nil {
-				return err
-			}
+			modified, err = applyAppendRowsXlsx(wb, op.Sheet, op.CellRows)
 		case "set_cell":
-			if err := applySetCellXlsx(wb, op.Sheet, op.Cells); err != nil {
-				return err
-			}
+			modified, err = applySetCellXlsx(wb, op.Sheet, op.Cells)
 		default:
-			return fmt.Errorf("unknown xlsx operation %q", op.Type)
+			err = fmt.Errorf("unknown xlsx operation %q", op.Type)
+		}
+		results = append(results, makeOpResult(i, op.Type, modified, err))
+		if err != nil {
+			return results, err
 		}
 	}
 	for _, sheet := range wb.Sheets() {
@@ -524,18 +614,23 @@ func editXlsx(input, output string, ops []EditOp) error {
 			s.Dimension = sml.NewCT_SheetDimension()
 		}
 	}
-	return wb.SaveToFile(output)
+	if err := wb.SaveToFile(output); err != nil {
+		return results, fmt.Errorf("save xlsx: %w", err)
+	}
+	return results, nil
 }
 
-func applyReplaceTextXlsx(wb *spreadsheet.Workbook, find, replace string) {
+func applyReplaceTextXlsx(wb *spreadsheet.Workbook, find, replace string) int {
 	if find == "" {
-		return
+		return 0
 	}
+	n := 0
 	for _, sheet := range wb.Sheets() {
 		for _, row := range sheet.Rows() {
 			for _, cell := range row.Cells() {
 				val := cell.GetFormattedValue()
 				if strings.Contains(val, find) {
+					n++
 					newVal := strings.ReplaceAll(val, find, replace)
 					if f, err := parseFloat(newVal); err == nil {
 						cell.SetNumber(f)
@@ -550,9 +645,10 @@ func applyReplaceTextXlsx(wb *spreadsheet.Workbook, find, replace string) {
 			}
 		}
 	}
+	return n
 }
 
-func applyAppendRowsXlsx(wb *spreadsheet.Workbook, sheetName string, rows []CellRowSpec) error {
+func applyAppendRowsXlsx(wb *spreadsheet.Workbook, sheetName string, rows []CellRowSpec) (int, error) {
 	sheet, err := wb.GetSheet(sheetName)
 	if err != nil {
 		sheets := wb.Sheets()
@@ -569,25 +665,26 @@ func applyAppendRowsXlsx(wb *spreadsheet.Workbook, sheetName string, rows []Cell
 			setCellValue(cell, val)
 		}
 	}
-	return nil
+	return len(rows), nil
 }
 
-func applySetCellXlsx(wb *spreadsheet.Workbook, sheetName string, cells []CellSpecXlsx) error {
+func applySetCellXlsx(wb *spreadsheet.Workbook, sheetName string, cells []CellSpecXlsx) (int, error) {
 	sheet, err := wb.GetSheet(sheetName)
 	if err != nil {
 		sheets := wb.Sheets()
 		if len(sheets) == 0 {
-			return fmt.Errorf("no sheets in workbook")
+			return 0, fmt.Errorf("no sheets in workbook")
 		}
 		sheet = sheets[0]
 	}
+	n := 0
 	for _, c := range cells {
 		if c.Cell == "" {
 			continue
 		}
 		colStr, rowIdx := parseCellRef(c.Cell)
 		if rowIdx == 0 {
-			return fmt.Errorf("invalid cell reference %q", c.Cell)
+			return n, fmt.Errorf("invalid cell reference %q", c.Cell)
 		}
 		var row spreadsheet.Row
 		found := false
@@ -606,8 +703,9 @@ func applySetCellXlsx(wb *spreadsheet.Workbook, sheetName string, cells []CellSp
 			cell = row.AddNamedCell(colStr)
 		}
 		setCellValue(cell, c.Value)
+		n++
 	}
-	return nil
+	return n, nil
 }
 
 func parseCellRef(ref string) (string, uint32) {
@@ -649,36 +747,48 @@ func parseFloat(s string) (float64, error) {
 
 // --- pptx ---
 
-func editPptx(input, output string, ops []EditOp) error {
+func editPptx(input, output string, ops []EditOp) ([]OpResult, error) {
 	pres, err := presentation.Open(input)
 	if err != nil {
-		return fmt.Errorf("open pptx: %w", err)
+		return nil, fmt.Errorf("open pptx: %w", err)
 	}
-	for _, op := range ops {
+	var results []OpResult
+	for i, op := range ops {
+		var modified int
 		switch op.Type {
 		case "replace_text":
-			applyReplaceTextPptx(pres, op.Find, op.Replace)
+			modified = applyReplaceTextPptx(pres, op.Find, op.Replace)
 		case "append_slides":
-			applyAppendSlidesPptx(pres, op.Slides)
+			modified = applyAppendSlidesPptx(pres, op.Slides)
 		case "remove_slide":
-			applyRemoveSlidePptx(pres, op.Find)
+			modified = applyRemoveSlidePptx(pres, op.Find)
 		default:
-			return fmt.Errorf("unknown pptx operation %q", op.Type)
+			err = fmt.Errorf("unknown pptx operation %q", op.Type)
+		}
+		results = append(results, makeOpResult(i, op.Type, modified, err))
+		if err != nil {
+			return results, err
 		}
 	}
-	return pres.SaveToFile(output)
+	if err := pres.SaveToFile(output); err != nil {
+		return results, fmt.Errorf("save pptx: %w", err)
+	}
+	return results, nil
 }
 
-func applyReplaceTextPptx(pres *presentation.Presentation, find, replace string) {
+func applyReplaceTextPptx(pres *presentation.Presentation, find, replace string) int {
 	if find == "" {
-		return
+		return 0
 	}
+	n := 0
 	for _, slide := range pres.Slides() {
-		replaceInSlideContent(slide, find, replace)
+		n += replaceInSlideContent(slide, find, replace)
 	}
+	return n
 }
 
-func replaceInSlideContent(slide presentation.Slide, find, replace string) {
+func replaceInSlideContent(slide presentation.Slide, find, replace string) int {
+	n := 0
 	for _, choice := range slide.X().CSld.SpTree.Choice {
 		for _, sp := range choice.Sp {
 			if sp.TxBody == nil {
@@ -687,6 +797,7 @@ func replaceInSlideContent(slide presentation.Slide, find, replace string) {
 			for _, p := range sp.TxBody.P {
 				for _, tr := range p.EG_TextRun {
 					if tr.R != nil && strings.Contains(tr.R.T, find) {
+						n++
 						tr.R.T = strings.ReplaceAll(tr.R.T, find, replace)
 					}
 				}
@@ -702,6 +813,7 @@ func replaceInSlideContent(slide presentation.Slide, find, replace string) {
 						for _, p := range innerSp.TxBody.P {
 							for _, tr := range p.EG_TextRun {
 								if tr.R != nil && strings.Contains(tr.R.T, find) {
+									n++
 									tr.R.T = strings.ReplaceAll(tr.R.T, find, replace)
 								}
 							}
@@ -711,9 +823,10 @@ func replaceInSlideContent(slide presentation.Slide, find, replace string) {
 			}
 		}
 	}
+	return n
 }
 
-func applyAppendSlidesPptx(pres *presentation.Presentation, slides []SlideSpec) {
+func applyAppendSlidesPptx(pres *presentation.Presentation, slides []SlideSpec) int {
 	for _, spec := range slides {
 		slide := pres.AddSlide()
 		tb := slide.AddTextBox()
@@ -730,19 +843,23 @@ func applyAppendSlidesPptx(pres *presentation.Presentation, slides []SlideSpec) 
 			run.SetText(body)
 		}
 	}
+	return len(slides)
 }
 
-func applyRemoveSlidePptx(pres *presentation.Presentation, find string) {
+func applyRemoveSlidePptx(pres *presentation.Presentation, find string) int {
 	if find == "" {
-		return
+		return 0
 	}
+	removed := 0
 	slides := pres.Slides()
 	for i := len(slides) - 1; i >= 0; i-- {
 		slide := slides[i]
 		if slideContainsText(slide, find) {
 			pres.RemoveSlide(slide)
+			removed++
 		}
 	}
+	return removed
 }
 
 func slideContainsText(slide presentation.Slide, text string) bool {

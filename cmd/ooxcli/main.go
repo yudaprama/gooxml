@@ -52,7 +52,9 @@ func usage() {
 Usage:
   ooxcli extract [--save <output.md>] [--imagedir <dir>] [--baseurl <url>] <input.docx|xlsx|pptx>
                                        Extract text as Markdown (stdout, or save to file with --save)
-  ooxcli edit <input.docx|xlsx|pptx> [--out <output>]            Apply edit operations (ops JSON via --ops or stdin)
+  ooxcli edit [--json] <input.docx|xlsx|pptx> [--out <output>] [--ops <json>]
+                                       Apply edit operations (ops JSON via --ops or stdin)
+                                       --json prints an EditResult JSON summary to stdout
   ooxcli info <input.docx|xlsx|pptx>                             Document info (JSON stdout)
   ooxcli validate <input.docx|xlsx|pptx>                         Validate document structure
 `)
@@ -229,12 +231,12 @@ func extractPptx(path, baseURL, savePath, imageDir string) error {
 // --- info -------------------------------------------------------------------
 
 type infoResult struct {
-	Path       string           `json:"path"`
-	Type       string           `json:"type"`
+	Path       string            `json:"path"`
+	Type       string            `json:"type"`
 	Properties map[string]string `json:"properties,omitempty"`
-	Docx       *docxInfo        `json:"docx,omitempty"`
-	Xlsx       *xlsxInfo        `json:"xlsx,omitempty"`
-	Pptx       *pptxInfo        `json:"pptx,omitempty"`
+	Docx       *docxInfo         `json:"docx,omitempty"`
+	Xlsx       *xlsxInfo         `json:"xlsx,omitempty"`
+	Pptx       *pptxInfo         `json:"pptx,omitempty"`
 }
 
 type docxInfo struct {
